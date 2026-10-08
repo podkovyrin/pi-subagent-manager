@@ -12,7 +12,12 @@ import { ThreadManager } from "./orch/manager.ts";
 import { loadManagerSettings } from "./prefs/settings.ts";
 import { configureAgents } from "./ui/settings-ui.ts";
 import { AgentNavigationController } from "./ui/status-ui.ts";
-import { AgentNavigationEditor } from "./ui/agent-navigation-editor.ts";
+import {
+  AgentNavigationEditor,
+  attachAgentNavigation,
+  type AgentNavigationEditorOptions,
+  type AgentNavigationHandle,
+} from "./ui/agent-navigation-editor.ts";
 import { createDriverFactory } from "./orch/runtime.ts";
 import { createInheritedToolSource } from "./orch/inherited-tools.ts";
 import { subagentPrompt } from "./orch/prompt.ts";
@@ -92,8 +97,11 @@ export default function piSubagent(pi: ExtensionAPI): void {
     summaryRunning = false;
   };
   let navigation = new AgentNavigationController();
-  let navigationEditor: AgentNavigationEditor | undefined;
-  let navigationEditorFactory: Parameters<ExtensionContext["ui"]["setEditorComponent"]>[0];
+  type EditorFactory = NonNullable<Parameters<ExtensionContext["ui"]["setEditorComponent"]>[0]>;
+  let navigationEditor: AgentNavigationHandle | undefined;
+  let navigationEditorFactory: EditorFactory | undefined;
+  // Another extension's editor factory that ours decorates, if one owned the slot first.
+  let decoratedFactory: EditorFactory | undefined;
   let navigationGeneration = 0;
   const closeNavigation = (disposeEditor = false) => {
     navigationGeneration++;
@@ -104,10 +112,14 @@ export default function piSubagent(pi: ExtensionAPI): void {
     }
   };
   const installNavigationEditor = (ctx: ExtensionContext, seedHistory: boolean) => {
-    // Pi has one custom-editor slot: do not replace another integration.
     if (!ctx.hasUI || ctx.mode !== "tui" || !ctx.ui.setEditorComponent) return;
+    // Pi has one custom-editor slot. If another integration owns it, decorate
+    // that editor instead of replacing it; reinstalling keeps the same base.
     const existingFactory = ctx.ui.getEditorComponent?.();
-    if (existingFactory && existingFactory !== navigationEditorFactory) return;
+    const baseFactory =
+      existingFactory && existingFactory === navigationEditorFactory
+        ? decoratedFactory
+        : existingFactory;
     // The host only transfers raw text, not cursor/undo/expanded-paste state.
     if (ctx.ui.getEditorText?.()) return;
     const history = buildSessionContext(ctx.sessionManager.getBranch()).messages.flatMap(
@@ -125,7 +137,7 @@ export default function piSubagent(pi: ExtensionAPI): void {
       },
     );
     navigationEditorFactory = (tui, theme, keys) => {
-      const editor = new AgentNavigationEditor(tui, theme, keys, {
+      const options: AgentNavigationEditorOptions = {
         // Initial startup hydrates after session_start; replacement editors do not.
         initialHistory: seedHistory ? history : undefined,
         generation: () => navigationGeneration,
@@ -165,10 +177,18 @@ export default function piSubagent(pi: ExtensionAPI): void {
         },
         onError: (error) =>
           context?.ui.notify(error instanceof Error ? error.message : String(error), "error"),
-      });
-      navigationEditor = editor;
+      };
+      if (!baseFactory) {
+        const editor = new AgentNavigationEditor(tui, theme, keys, options);
+        navigationEditor = editor;
+        return editor;
+      }
+      // Keep the other extension's editor; add arrows only if it is CustomEditor-like.
+      const editor = baseFactory(tui, theme, keys);
+      navigationEditor = attachAgentNavigation(editor, keys, options);
       return editor;
     };
+    decoratedFactory = baseFactory;
     ctx.ui.setEditorComponent(navigationEditorFactory);
   };
   let persistenceSignature = "";

@@ -29,12 +29,37 @@ export interface AgentNavigationEditorOptions {
   initialHistory?: readonly string[];
 }
 
+/** Public editor surface used by arrow navigation; every CustomEditor provides it. */
+export type NavigableEditor = Pick<
+  CustomEditor,
+  | "handleInput"
+  | "getCursor"
+  | "getText"
+  | "isShowingAutocomplete"
+  | "addToHistory"
+  | "onChange"
+  | "onExtensionShortcut"
+  | "focused"
+>;
+
+function isNavigableEditor(editor: unknown): editor is NavigableEditor {
+  const value = editor as Partial<Record<keyof NavigableEditor, unknown>> | undefined;
+  return (
+    typeof value?.handleInput === "function" &&
+    typeof value.getCursor === "function" &&
+    typeof value.getText === "function" &&
+    typeof value.isShowingAutocomplete === "function" &&
+    typeof value.addToHistory === "function"
+  );
+}
+
 /**
  * Physical arrow boundary adapter. It owns no session/history internals and never
  * changes the draft. Install once per root UI lifecycle, not for tree navigation.
- * Another custom editor occupies the same host slot; skip installation rather than stack.
+ * It runs on top of exactly one stock dispatch, so it can sit on our own editor
+ * or decorate an editor that another extension installed in the single host slot.
  */
-export class AgentNavigationEditor extends CustomEditor {
+class ArrowNavigation {
   private pending: "left" | "right" | undefined;
   private disposed = false;
   private dispatchDepth = 0;
@@ -43,17 +68,14 @@ export class AgentNavigationEditor extends CustomEditor {
   private jumpPending = false;
 
   constructor(
-    tui: TUI,
-    theme: EditorTheme,
+    private editor: NavigableEditor,
     private navigationKeys: KeybindingsManager,
     private navigation: AgentNavigationEditorOptions,
-    options?: CustomEditorOptions,
   ) {
-    super(tui, theme, navigationKeys, options);
     // SessionStartEvent.reason distinguishes startup (host hydrates AFTER
     // installation) from reload/replacement (explicit public hydration needed).
     // Never infer replay from prompt text: intentional repetitions are valid.
-    for (const text of navigation.initialHistory ?? []) this.addToHistory(text);
+    for (const text of navigation.initialHistory ?? []) editor.addToHistory(text);
   }
 
   /** Invalidates queued work without resetting a competing extension's editor. */
@@ -84,7 +106,8 @@ export class AgentNavigationEditor extends CustomEditor {
     return true;
   }
 
-  override handleInput(data: string): void {
+  handle(data: string, dispatch: (data: string) => void): void {
+    const editor = this.editor;
     const outer = this.dispatchDepth === 0;
     const direction = this.ordinaryArrow(data, "left") ? "left"
       : this.ordinaryArrow(data, "right") ? "right" : undefined;
@@ -96,8 +119,8 @@ export class AgentNavigationEditor extends CustomEditor {
     if (data.includes("\x1b[200~")) this.pastePending = true;
     if (wasPaste && data.includes("\x1b[201~")) this.pastePending = false;
     const wasJump = this.jumpPending;
-    const cursor = this.getCursor();
-    const text = this.getText();
+    const cursor = editor.getCursor();
+    const text = editor.getText();
     const lines = text.split("\n");
     const atBoundary = direction === "left"
       ? cursor.line === 0 && cursor.col === 0
@@ -106,36 +129,36 @@ export class AgentNavigationEditor extends CustomEditor {
     const eligible =
       outer &&
       direction !== undefined &&
-      this.focused &&
+      editor.focused &&
       !this.disposed &&
       !wasPaste &&
       !wasJump &&
-      !this.isShowingAutocomplete() &&
+      !editor.isShowingAutocomplete() &&
       atBoundary;
     const generation = eligible ? this.navigation.generation() : undefined;
     let changed = false;
     let consumed = false;
-    const originalChange = this.onChange;
-    const originalShortcut = this.onExtensionShortcut;
+    const originalChange = editor.onChange;
+    const originalShortcut = editor.onExtensionShortcut;
     const observeChange = (value: string) => {
       changed = true;
-      originalChange?.call(this, value);
+      originalChange?.call(editor, value);
     };
     const observeShortcut = (value: string) => {
-      const handled = originalShortcut?.call(this, value) ?? false;
+      const handled = originalShortcut?.call(editor, value) ?? false;
       consumed ||= handled && value === data;
       return handled;
     };
-    this.onChange = observeChange;
-    this.onExtensionShortcut = observeShortcut;
+    editor.onChange = observeChange;
+    editor.onExtensionShortcut = observeShortcut;
     this.dispatchDepth++;
     try {
       // Exactly one stock dispatch, preserving host-wired application controls.
-      super.handleInput(data);
+      dispatch(data);
     } finally {
       this.dispatchDepth--;
-      if (this.onChange === observeChange) this.onChange = originalChange;
-      if (this.onExtensionShortcut === observeShortcut) this.onExtensionShortcut = originalShortcut;
+      if (editor.onChange === observeChange) editor.onChange = originalChange;
+      if (editor.onExtensionShortcut === observeShortcut) editor.onExtensionShortcut = originalShortcut;
       if (consumed) this.pastePending = previousPaste;
       if (!consumed) {
         // Track only public input; over-suppress when precedence is ambiguous.
@@ -149,13 +172,13 @@ export class AgentNavigationEditor extends CustomEditor {
         }
       }
     }
-    const after = this.getCursor();
+    const after = editor.getCursor();
     if (
       eligible &&
       !consumed &&
       !changed &&
-      !this.isShowingAutocomplete() &&
-      this.getText() === text &&
+      !editor.isShowingAutocomplete() &&
+      editor.getText() === text &&
       after.line === cursor.line &&
       after.col === cursor.col
     ) {
@@ -176,15 +199,15 @@ export class AgentNavigationEditor extends CustomEditor {
     this.pending = direction;
     const epoch = this.inputEpoch;
     queueMicrotask(() => {
-      const after = this.getCursor();
+      const after = this.editor.getCursor();
       if (
         this.disposed ||
-        !this.focused ||
+        !this.editor.focused ||
         this.inputEpoch !== epoch ||
         this.navigation.generation() !== generation ||
         !allowed() ||
-        this.isShowingAutocomplete() ||
-        this.getText() !== text ||
+        this.editor.isShowingAutocomplete() ||
+        this.editor.getText() !== text ||
         after.line !== cursor.line ||
         after.col !== cursor.col
       ) {
@@ -206,4 +229,63 @@ export class AgentNavigationEditor extends CustomEditor {
       }
     });
   }
+}
+
+/**
+ * Default editor when no other extension owns the host slot.
+ * Another custom editor is decorated with attachAgentNavigation instead.
+ */
+export class AgentNavigationEditor extends CustomEditor {
+  private arrows: ArrowNavigation;
+
+  constructor(
+    tui: TUI,
+    theme: EditorTheme,
+    navigationKeys: KeybindingsManager,
+    navigation: AgentNavigationEditorOptions,
+    options?: CustomEditorOptions,
+  ) {
+    super(tui, theme, navigationKeys, options);
+    this.arrows = new ArrowNavigation(this, navigationKeys, navigation);
+  }
+
+  /** Invalidates queued work without resetting a competing extension's editor. */
+  dispose(): void {
+    this.arrows.dispose();
+  }
+
+  override handleInput(data: string): void {
+    this.arrows.handle(data, (value) => super.handleInput(value));
+  }
+}
+
+export interface AgentNavigationHandle {
+  dispose(): void;
+}
+
+/**
+ * Adds arrow navigation to an editor that another extension created, so both
+ * share the single custom-editor slot. The editor keeps its own rendering and
+ * input; only its public handleInput is wrapped. Returns undefined, and leaves
+ * the editor untouched, if it does not expose the public CustomEditor surface.
+ */
+export function attachAgentNavigation(
+  editor: unknown,
+  navigationKeys: KeybindingsManager,
+  navigation: AgentNavigationEditorOptions,
+): AgentNavigationHandle | undefined {
+  if (!isNavigableEditor(editor)) return undefined;
+  const arrows = new ArrowNavigation(editor, navigationKeys, navigation);
+  const original = editor.handleInput;
+  const wrapped = function (this: NavigableEditor, data: string) {
+    arrows.handle(data, (value) => original.call(editor, value));
+  };
+  editor.handleInput = wrapped;
+  return {
+    dispose() {
+      arrows.dispose();
+      // Do not undo a later wrapper that another extension added on top.
+      if (editor.handleInput === wrapped) editor.handleInput = original;
+    },
+  };
 }

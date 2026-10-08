@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { mock } from "node:test";
-import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { CustomEditor, SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { KeybindingsManager } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/keybindings.js";
 import { setKeybindings, TuiMainScreen, type Terminal } from "@earendil-works/pi-tui";
 import piSubagent from "../src/index.ts";
@@ -51,7 +51,7 @@ async function fixture(
   }) => Promise<void>,
   options: {
     mode?: "tui" | "rpc"; hasUI?: boolean; draft?: string;
-    competingEditor?: boolean; reason?: "startup" | "resume";
+    competingEditor?: boolean | Function; reason?: "startup" | "resume";
     threads?: ThreadView[];
     widgetMode?: "full" | "minimal";
     nerdFontIcons?: boolean;
@@ -91,6 +91,8 @@ async function fixture(
   };
   let editor: AgentNavigationEditor | undefined;
   let installations = 0;
+  let currentFactory = typeof options.competingEditor === "function" ? options.competingEditor
+    : options.competingEditor ? () => ({ render: () => [] }) : undefined;
   let widget: { render(width: number): string[]; dispose?(): void } | undefined;
   let command: any;
   const pi = {
@@ -115,9 +117,10 @@ async function fixture(
       },
       notify() {}, custom: driver.custom,
       getEditorText: () => options.draft ?? "",
-      getEditorComponent: () => options.competingEditor ? (() => ({})) : undefined,
+      getEditorComponent: () => currentFactory,
       setEditorComponent(factory: Function) {
         installations++;
+        currentFactory = factory;
         editor = factory(host, {
           borderColor: (text: string) => text,
           selectList: {
@@ -386,17 +389,38 @@ test("root shutdown cancels queued collapse", async () => {
   }, { threads: [thread("running")] });
 });
 
-test("non-TUI contexts and existing editors leave the custom-editor slot untouched", async () => {
+test("non-TUI contexts and drafts leave the editor slot untouched; other editors are kept", async () => {
   for (const options of [
     { mode: "rpc" as const }, { hasUI: false },
     { draft: "existing draft" }, { competingEditor: true },
   ]) {
     await fixture(async ({ installations, command, ctx, driver }) => {
-      assert.equal(installations(), 0);
+      assert.equal(installations(), "competingEditor" in options ? 1 : 0);
       if (options.mode === undefined && options.hasUI !== false) {
         await command.handler("tree", ctx);
         assert.equal(driver.stats.outerOpens, 1, "existing editors retain command navigation");
       }
     }, options);
   }
+});
+
+test("a competing CustomEditor keeps its input and gains Left navigation", async () => {
+  class OtherEditor extends CustomEditor {
+    inputs: string[] = [];
+    override handleInput(data: string): void {
+      this.inputs.push(data);
+      super.handleInput(data);
+    }
+  }
+  await fixture(async ({ editor, driver }) => {
+    const main = editor() as unknown as OtherEditor;
+    assert.ok(main instanceof OtherEditor);
+    main.handleInput("\x1b[D");
+    await settle();
+    assert.equal(driver.stats.outerOpens, 1);
+    assert.deepEqual(main.inputs, ["\x1b[D"]);
+  }, {
+    competingEditor: (tui: any, theme: any, keys: any) => new OtherEditor(tui, theme, keys),
+    threads: [thread("running")],
+  });
 });
